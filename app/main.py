@@ -1,7 +1,17 @@
-from fastapi import FastAPI, UploadFile, File
-import fitz
+from fastapi import FastAPI, File, HTTPException, UploadFile
 
-app = FastAPI()
+from app.models import ContractAnalysisResponse
+from app.services.ai_service import analyze_clause, ping_model
+from app.services.pdf_service import (
+    extract_text_from_pdf,
+    split_text_into_clauses,
+)
+
+app = FastAPI(title="AI Contract Risk Comparator")
+
+# MVP limit: analyze only the first N clauses to keep response time sane
+# with a local model. Raise/remove once moved to a bigger model or batching.
+MAX_CLAUSES = 10
 
 
 @app.get("/")
@@ -9,18 +19,29 @@ def root():
     return {"message": "AI Contract Risk Comparator API"}
 
 
-@app.post("/upload-contract/")
+@app.post("/upload-contract/", response_model=ContractAnalysisResponse)
 async def upload_contract(file: UploadFile = File(...)):
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
     content = await file.read()
 
-    pdf = fitz.open(stream=content, filetype="pdf")
+    try:
+        text = extract_text_from_pdf(content)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read the PDF file.")
 
-    text = ""
+    clauses = split_text_into_clauses(text)
+    risks = [analyze_clause(clause) for clause in clauses[:MAX_CLAUSES]]
 
-    for page in pdf:
-        text += page.get_text()
+    return ContractAnalysisResponse(
+        filename=file.filename,
+        total_clauses=len(clauses),
+        analyzed_clauses=len(risks),
+        risks=risks,
+    )
 
-    return {
-        "filename": file.filename,
-        "text_preview": text[:1000]
-    }
+
+@app.get("/test-ollama/")
+def test_ollama():
+    return {"response": ping_model()}
