@@ -1,10 +1,17 @@
-import json
+from fastapi import FastAPI, File, HTTPException, UploadFile
 
-import fitz
-import ollama
-from fastapi import FastAPI, File, UploadFile
+from app.models import ContractAnalysisResponse
+from app.services.ai_service import analyze_clause, ping_model
+from app.services.pdf_service import (
+    extract_text_from_pdf,
+    split_text_into_clauses,
+)
 
-app = FastAPI()
+app = FastAPI(title="AI Contract Risk Comparator")
+
+# MVP limit: analyze only the first N clauses to keep response time sane
+# with a local model. Raise/remove once moved to a bigger model or batching.
+MAX_CLAUSES = 10
 
 
 @app.get("/")
@@ -12,118 +19,29 @@ def root():
     return {"message": "AI Contract Risk Comparator API"}
 
 
-def extract_text_from_pdf(content: bytes) -> str:
-    pdf = fitz.open(stream=content, filetype="pdf")
-
-    text = ""
-
-    for page in pdf:
-        text += page.get_text()
-
-    return text
-
-
-def split_text_into_clauses(text: str) -> list[str]:
-    clean_text = text.replace("\n", " ")
-    clauses = clean_text.split(".")
-
-    return [clause.strip() for clause in clauses if clause.strip()]
-
-
-def analyze_clause_with_ollama(clause: str) -> dict:
-    prompt = f"""
-You are a contract risk analysis API.
-
-Analyze the contract clause.
-
-IMPORTANT RULES:
-- Return ONLY pure JSON
-- Do NOT use markdown
-- Do NOT write explanations outside JSON
-- Do NOT use ```json
-- Do NOT add extra text
-
-Return this exact JSON format:
-
-{{
-    "risk_level": "low",
-    "risk_score": 1,
-    "description": "Explain the specific risk in 1-2 sentences"
-}}
-
-The description must clearly explain:
-- what the risk is
-- why it may affect the user
-
-Clause:
-{clause}
-"""
-
-    response = ollama.chat(
-        model="llama3.2:1b",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-    )
-
-    content = response["message"]["content"]
-    content = content.replace("```json", "")
-    content = content.replace("```", "")
-    content = content.strip()
-
-    try:
-        parsed_response = json.loads(content)
-    except json.JSONDecodeError:
-        parsed_response = {
-            "risk_level": "unknown",
-            "risk_score": 0,
-            "description": content,
-        }
-
-    return {
-        "clause": clause,
-        "risk_level": parsed_response.get("risk_level", "unknown"),
-        "risk_score": parsed_response.get("risk_score", 0),
-        "description": str(parsed_response.get("description", "")).replace("{", "").replace("}", "").replace('"', ""),
-    }
-
-
-@app.post("/upload-contract/")
+@app.post("/upload-contract/", response_model=ContractAnalysisResponse)
 async def upload_contract(file: UploadFile = File(...)):
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
     content = await file.read()
 
-    text = extract_text_from_pdf(content)
+    try:
+        text = extract_text_from_pdf(content)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read the PDF file.")
+
     clauses = split_text_into_clauses(text)
+    risks = [analyze_clause(clause) for clause in clauses[:MAX_CLAUSES]]
 
-    analyzed_risks = []
-
-    for clause in clauses[:10]:
-        analyzed_clause = analyze_clause_with_ollama(clause)
-        analyzed_risks.append(analyzed_clause)
-
-    return {
-        "filename": file.filename,
-        "total_clauses": len(clauses),
-        "analyzed_clauses": len(analyzed_risks),
-        "risks": analyzed_risks,
-    }
+    return ContractAnalysisResponse(
+        filename=file.filename,
+        total_clauses=len(clauses),
+        analyzed_clauses=len(risks),
+        risks=risks,
+    )
 
 
 @app.get("/test-ollama/")
 def test_ollama():
-    response = ollama.chat(
-        model="llama3.2:1b",
-        messages=[
-            {
-                "role": "user",
-                "content": "Say hello in one short sentence.",
-            }
-        ],
-    )
-
-    return {
-        "response": response["message"]["content"],
-    }
+    return {"response": ping_model()}
