@@ -22,3 +22,12 @@ class ContractAnalysisResponse(BaseModel):
     total_clauses: int
     analyzed_clauses: int
     risks: list[ClauseRisk]
+
+
+class ContractComparison(BaseModel):
+    contract_a: ContractAnalysisResponse
+    contract_b: ContractAnalysisResponse
+    avg_score_a: float
+    avg_score_b: float
+    riskier_contract: str
+    summary: str
